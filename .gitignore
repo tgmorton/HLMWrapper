@@ -1,0 +1,35 @@
+# Sensitive data — never commit subject-level CSV/SAV
+examples/data/
+*.sav
+*.dta
+*.por
+
+# Keep .csv only inside examples/data/ blocked above; commit sample csv elsewhere
+examples/data/*.csv
+examples/data/*.tsv
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+.Rapp.history
+
+# macOS
+.DS_Store
+
+# Build artifacts
+hlmwrap_v*.zip
+*.tar.gz
+
+# Whisky workspace artifacts (the wrapper writes into the bottle, not here,
+# but if anyone copies one out by mistake we don't want it tracked)
+work/
+*.mdm
+*.mdmt
+*.hlm
+*.geq
+*.html
+*.STS
+HLM*MDM.STS
