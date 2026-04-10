@@ -278,8 +278,22 @@ hlm_fit <- function(mdm, spec, model_name = "fit", timeout = 600L) {
     title         = parsed$title,
     messages      = parsed$messages,
     warnings      = parsed$warnings,
-    raw_html      = if (produced_html) readLines(out_mac, warn = FALSE) else NULL
+    html          = if (produced_html)
+                      paste(readLines(out_mac, warn = FALSE), collapse = "\n")
+                    else NA_character_
   ), class = "hlm_result")
+}
+
+#' Save the raw HLM HTML output to a chosen path.
+#'
+#' @param result   an hlm_result returned by hlm_fit
+#' @param path     destination path for the HTML file
+hlm_save_html <- function(result, path) {
+  stopifnot(inherits(result, "hlm_result"))
+  if (is.na(result$html))
+    stop("no HTML output is attached to this result")
+  writeLines(result$html, path)
+  invisible(path)
 }
 
 #' Print method for hlm_result.
@@ -312,5 +326,10 @@ print.hlm_result <- function(x, ...) {
     cat("  Warnings:\n")
     for (w in x$warnings) cat("    *", w, "\n")
   }
+  cat("  Files:\n")
+  cat("    .hlm command:", x$files$hlm, "\n")
+  cat("    .html output:", x$files$html, "\n")
+  cat("  $html holds the full HTML as a single string;\n")
+  cat("  hlm_save_html(result, \"path.html\") to write it elsewhere.\n")
   invisible(x)
 }
