@@ -100,6 +100,135 @@ mean uncentered.
 
 ---
 
+## Result object reference
+
+`hlm_fit()` returns a list of class `hlm_result` with these fields. All
+table-shaped fields are tibbles (or `NULL` if not produced).
+
+| Field | Type | Description |
+|---|---|---|
+| `spec` | `hlm2_spec`/`hlm3_spec` | the spec object you passed in |
+| `mdm` | `hlm_mdm` | the MDM object you passed in |
+| `workspace` | `hlm_workspace` | bottle workspace metadata |
+| `exit` | integer | raw exit code from the solver (see Exit codes below) |
+| `exit_meaning` | character | `"success"` / `"file_error"` / `"near_singularity"` / `"unknown_N"` |
+| `success` | logical | `TRUE` if `exit ∈ {0, 136}` AND HTML was produced |
+| `duration` | numeric | wall-clock seconds for the fit |
+| `sample_sizes` | named list | `list(level1=N, level2=M, level3=K)` from the HTML header |
+| `method` | character | e.g. `"full maximum likelihood"`, `"restricted maximum likelihood"` |
+| `title` | character | the `title:` directive value |
+| `deviance` | numeric or `NULL` | model deviance, if reported |
+| `fixed_effects` | tibble | columns: `for_term`, `term`, `coefficient`, `se`, `t_ratio`, `df`, `p_value` |
+| `fixed_effects_robust` | tibble | same shape, robust SE variant |
+| `variance_components` | tibble *or* list of tibbles | one tibble for HLM2; HLM3 returns a list with one tibble per level pair |
+| `reliability` | tibble or `NULL` | random-effect reliability estimates |
+| `warnings` | character vector | free-text warnings extracted from the HTML body (e.g. `"near singularity"`) |
+| `html` | character (single string) | the entire HLM HTML report — useful for `cat(result$html, file = "out.html")` or for re-parsing |
+| `files` | named list | `list(hlm=..., hlm_text=..., html=..., mdm=...)` — paths inside the bottle |
+
+`fixed_effects` rows are organized depth-first. The `for_term` column
+holds the upper-level coefficient context (e.g. `"For INTRCPT2, β00"`),
+and `term` holds the actual γ predictor (`"INTRCPT3, γ000"`,
+`"HC_C_Z_N, γ001"`).
+
+Convenience helpers:
+
+```r
+hlm_save_html(result, "/where/you/want/it.html")  # write the .html elsewhere
+result$files$html                                  # path inside the bottle
+print(result)                                      # tidy console summary
+```
+
+P-values like `<0.001` are coerced to numeric `0.001` (the displayed
+threshold), so you can filter `result$fixed_effects |> filter(p_value < 0.05)`
+without worrying about character columns.
+
+---
+
+## Spec parameters reference
+
+### `hlm3_spec()` — 3-level linear model
+
+| Param | Type | Default | Meaning |
+|---|---|---|---|
+| `outcome` | character(1) | required | level-1 outcome variable name |
+| `l1_predictors` | character vector or list | `character()` | level-1 fixed predictors. Use `list(list(name="X", center="grand"))` to add centering codes |
+| `l2` | named list | `list()` | per-level-1-coefficient overrides. Names = `"INTRCPT"` or any L1 predictor name. Each value: `list(predictors=…, random=TRUE/FALSE)`. Defaults to `predictors=NULL, random=(coef=="INTRCPT")` |
+| `l3` | named list | `list()` | per-level-2-coefficient overrides. Names use `"L1coef/L2coef"` paths, e.g. `"INTRCPT/INTRCPT"`, `"INTRCPT/HOT"`. Same shape as `l2` entries. Defaults to fixed intercept-only |
+| `numit` | integer | `100` | max EM iterations |
+| `stopval` | numeric | `1e-6` | likelihood-change convergence criterion |
+| `fishertype` | integer (1/2) | `2` | Fisher scoring variant |
+| `accel` | integer | `5` | acceleration step every N iters |
+| `fixtau2` | integer (0..3) | `3` | level-2 tau constraint strategy |
+| `fixtau3` | integer (0..3) | `3` | level-3 tau constraint strategy |
+| `hypoth` | `"y"`/`"n"` | `"n"` | run multivariate hypothesis tests |
+| `fulloutput` | `"y"`/`"n"` | `"n"` | verbose output |
+| `title` | character | `"no title"` | run title (string) |
+| `lvr_beta` | `"y"`/`"n"` | `"n"` | latent variable regression for beta |
+| `constrain` | `"Y"`/`"N"` | `"N"` | impose fixed-effect constraints |
+| `varianceknown` | character | `"none"` | name of v-known variable |
+| `level1_deletion` | character | `"none"` | name of L1 deletion variable |
+| `l1_weight`, `l2_weight`, `l3_weight` | character | `"none"` | precision weights at each level |
+| `extras` | named list | `list()` | raw `key=value` directives written verbatim. Validated against the HLM3 directive whitelist; unknown keys throw an error before they can hang the solver |
+
+### `hlm2_spec()` — 2-level linear model
+
+Same as `hlm3_spec()` minus the `l3` argument and `fixtau2/fixtau3`,
+plus these HLM2-specific options:
+
+| Param | Type | Default | Meaning |
+|---|---|---|---|
+| `fixtau` | integer (0..3) | `3` | tau constraint strategy (HLM2 has only one tau) |
+| `lev1ols` | integer | `10` | number of OLS prep iterations |
+| `heterol1var` | `"y"`/`"n"` | `"n"` | model heterogeneous L1 variance |
+| `homvar` | `"y"`/`"n"` | `"n"` | test homogeneity of L1 variance |
+| `mlf` | `"y"`/`"n"` | `"n"` | full ML (`y`) vs REML (`n`) |
+| `lvr` | `"y"`/`"n"` | `"n"` | latent variable regression (HLM2 calls it `lvr` not `lvr-beta`) |
+| `level2_deletion` | character | `"none"` | L2 deletion variable |
+
+### `hlm_build_mdm3()` / `hlm_build_mdm2()` — data prep
+
+| Param | Type | Default | Meaning |
+|---|---|---|---|
+| `level1`, `level2`, `level3` | df / file path | required | data sources. Accepts data.frames, `.csv`, `.tsv`, `.sav`, `.dta`, `.xlsx`. `level3` only for `hlm_build_mdm3` |
+| `l3_id`, `l2_id` | character(1) | required | name of the ID column at each level. `l3_id` only for `hlm_build_mdm3` |
+| `vars_l1`, `vars_l2`, `vars_l3` | character vector or `NULL` | `NULL` | columns to include. `NULL` = include all source columns (recommended; HLM mis-reads partial files in some cases). Order must match source-file order if you specify a subset. |
+| `workspace` | character or `hlm_workspace` | `"default"` | workspace name (creates a fresh one inside the bottle) |
+| `mdm_name` | character | `"model"` | basename for the .mdm file |
+| `l1_missing` | logical | `TRUE` | whether L1 has missing values |
+
+---
+
+## Exit codes & error handling
+
+The solver returns one of these:
+
+| Exit | `exit_meaning` | What it means | Result still usable? |
+|---|---|---|---|
+| `0` | `success` | Model converged, all output written | Yes |
+| `100` | `file_error` | Failed to open an input file (`.mdm`, `.hlm`, or `.sav`) | No — `.html` not produced |
+| `136` | `near_singularity` | Detected near-singular fixed-effects matrix; solver aborted but **wrote partial output first** | Partly — `result$fixed_effects` may still have rows; `result$warnings` will explain why. Check `result$success`. |
+| any other | `unknown_N` | Anything else (occasionally `11`, etc.) | Inspect `result$html` directly |
+
+`hlm_build_mdm3()` and `hlm_build_mdm2()` raise on these conditions
+*before* invoking the solver:
+
+- `"requested var(s) not in source: …"` — `vars_l1/2/3` references columns that aren't in the input data
+- `"variable name collisions after HLM 8-char truncation: …"` — two columns truncate to the same 8-char name
+- `"level-N file has duplicate keys …"` — non-unique IDs at level 2 or 3
+- `"level-1 has N (l3,l2) key(s) absent from level-2"` — emitted as a `warning()`, not an error
+
+`hlm3_spec()` / `hlm2_spec()` raise on:
+
+- `"unknown directive(s) — these would HANG hlm*.exe on a getchar() prompt: …"` — keys in `extras` that aren't in the directive whitelist
+- `"variable name(s) exceed HLM's 8-character limit: …"` — the spec references a name HLM will silently truncate
+
+`hlm_fit()` doesn't raise even on solver failure — it always returns a
+`hlm_result` so you can inspect `$exit`, `$success`, `$warnings`, and
+`$html`. Check `result$success` before trusting `result$fixed_effects`.
+
+---
+
 # Setup on a new machine
 
 The rest of this file is an instruction set for an autonomous agent
