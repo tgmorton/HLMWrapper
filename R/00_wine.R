@@ -94,11 +94,15 @@ hlm_workspace <- function(name, clean = FALSE) {
 hlm_ensure_whlm_running <- function() {
   pid_file <- file.path(tempdir(), "hlmwrap_whlm.pid")
   if (file.exists(pid_file)) {
-    pid <- as.integer(readLines(pid_file, n = 1))
-    if (length(pid) && !is.na(pid) &&
-        nchar(suppressWarnings(system2("ps", c("-p", pid, "-o", "pid="),
-                                       stdout = TRUE, stderr = FALSE))[1]) > 0)
-      return(pid)
+    pid <- suppressWarnings(as.integer(readLines(pid_file, n = 1)))
+    alive <- tryCatch({
+      out <- suppressWarnings(system2("ps", c("-p", pid, "-o", "pid="),
+                                      stdout = TRUE, stderr = FALSE))
+      length(out) > 0L && !is.na(out[1]) && nchar(out[1]) > 0L
+    }, error = function(e) FALSE)
+    if (length(pid) && !is.na(pid) && isTRUE(alive)) return(pid)
+    # stale pid file — clean it up and fall through to relaunch whlm.exe
+    try(file.remove(pid_file), silent = TRUE)
   }
   wine <- hlm_wine_bin()
   prefix <- path.expand(file.path(WHISKY_BOTTLES_DIR, WHISKY_BOTTLE))
