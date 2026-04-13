@@ -184,56 +184,83 @@ hlm_build_mdm2 <- function(level1, level2,
                            vars_l1 = NULL, vars_l2 = NULL,
                            workspace = "default",
                            mdm_name = "model",
-                           l1_missing = TRUE) {
+                           l1_missing = TRUE,
+                           method = c("direct", "wine")) {
+  method <- match.arg(method)
   ws <- if (inherits(workspace, "hlm_workspace")) workspace
         else hlm_workspace(workspace, clean = TRUE)
   l1 <- hlm_load(level1)
   l2 <- hlm_load(level2)
-  if (is.null(vars_l1)) vars_l1 <- setdiff(names(l1), l2_id)
-  if (is.null(vars_l2)) vars_l2 <- setdiff(names(l2), l2_id)
+  pick2 <- function(df, ids, requested) {
+    cols <- setdiff(names(df), ids)
+    if (!is.null(requested)) {
+      bad <- setdiff(requested, names(df))
+      if (length(bad)) stop("requested var(s) not in source: ",
+                            paste(bad, collapse = ", "))
+      cols <- intersect(cols, requested)
+    }
+    cols
+  }
+  if (is.null(vars_l1)) vars_l1 <- pick2(l1, l2_id, NULL)
+  if (is.null(vars_l2)) vars_l2 <- pick2(l2, l2_id, NULL)
   hlm_check_higher(l2, l2_id, level = 2L)
   l1_sorted <- hlm_sort_l1(l1, l3_id = l2_id, l2_id = NULL)
   if (!attr(l1_sorted, "was_sorted"))
     message("hlmwrap: level-1 was not sorted by ", l2_id, "; sorted automatically.")
-  l1_out <- l1_sorted[, c(l2_id, vars_l1), drop = FALSE]
-  l2_out <- l2[,        c(l2_id, vars_l2), drop = FALSE]
+
+  # Preserve source column order + truncate names
+  l1_full <- intersect(names(l1_sorted), c(l2_id, vars_l1))
+  l2_full <- intersect(names(l2),        c(l2_id, vars_l2))
+  l1_map <- hlm_truncate_names(l1_full)
+  l2_map <- hlm_truncate_names(l2_full)
+  l1_out <- l1_sorted[, l1_full, drop = FALSE]
+  l2_out <- l2[,        l2_full, drop = FALSE]
+  names(l1_out) <- l1_map[names(l1_out)]
+  names(l2_out) <- l2_map[names(l2_out)]
+  l2_id_t <- unname(l1_map[l2_id])
+  vars_l1 <- unname(l1_map[vars_l1])
+  vars_l2 <- unname(l2_map[vars_l2])
+
   l1_p <- hlm_write_sav(l1_out, ws, "level1.sav")
   l2_p <- hlm_write_sav(l2_out, ws, "level2.sav")
-  mdmt_text <- paste(c(
-    "#HLM2 MDM CREATION TEMPLATE",
-    "mdmtype:0",
-    "rawdattype:spss",
-    paste0("l1fname:", l1_p$win),
-    paste0("l2fname:", l2_p$win),
-    paste0("l1missing:", if (l1_missing) "y" else "n"),
-    "timeofdeletion:analysis",
-    paste0("mdmname:", mdm_name),
-    "*begin l1vars",
-    paste0("level2id:", l2_id),
-    vars_l1,
-    "*end l1vars",
-    "*begin l2vars",
-    paste0("level2id:", l2_id),
-    vars_l2,
-    "*end l2vars"
-  ), collapse = "\n")
-  mdmt <- hlm_write_mdmt(mdmt_text, ws, mdm_name)
-  build <- hlm_make_mdm(mdmt, ws, solver = "hlm2.exe")
-  if (!build$success)
-    stop("hlm2.exe -w failed (exit ", build$exit, "; ",
-         .hlm_exit_meaning(build$exit), ")")
+
+  mdm_path <- file.path(ws$mac, mdm_name)
+  sts_path <- file.path(ws$mac, "HLM2MDM.STS")
+
+  if (method == "direct") {
+    hlm_write_mdm2(l1_out, l2_out,
+                   l2_id = l2_id_t,
+                   l1_vars = vars_l1, l2_vars = vars_l2,
+                   mdm_path = mdm_path,
+                   l1_sav_win = l1_p$win, l2_sav_win = l2_p$win,
+                   l1_missing = l1_missing)
+    if (!file.exists(mdm_path))
+      stop("R-native HLM2 .mdm writer failed")
+  } else {
+    mdmt_text <- paste(c(
+      "#HLM2 MDM CREATION TEMPLATE",
+      "mdmtype:0", "rawdattype:spss",
+      paste0("l1fname:", l1_p$win), paste0("l2fname:", l2_p$win),
+      paste0("l1missing:", if (l1_missing) "y" else "n"),
+      "timeofdeletion:analysis", paste0("mdmname:", mdm_name),
+      "*begin l1vars", paste0("level2id:", l2_id_t), vars_l1, "*end l1vars",
+      "*begin l2vars", paste0("level2id:", l2_id_t), vars_l2, "*end l2vars"
+    ), collapse = "\n")
+    mdmt <- hlm_write_mdmt(mdmt_text, ws, mdm_name)
+    build <- hlm_make_mdm(mdmt, ws, solver = "hlm2.exe")
+    if (!build$success)
+      stop("hlm2.exe -w failed (exit ", build$exit, ")")
+    sts_path <- build$sts
+  }
+
   structure(list(
-    workspace = ws,
-    level     = 2L,
-    mdm       = build$mdm,
-    mdm_win   = build$mdm_win,
-    mdmt      = mdmt$mac,
-    mdmt_win  = mdmt$win,
-    sts       = build$sts,
+    workspace = ws, level = 2L, method = method,
+    mdm = mdm_path, mdm_win = hlm_to_win_path(mdm_path),
+    sts = if (file.exists(sts_path)) sts_path else NA_character_,
     l1_path = l1_p, l2_path = l2_p,
     l2_id = l2_id,
     vars_l1 = vars_l1, vars_l2 = vars_l2,
-    rows = list(l1 = l1_p$rows, l2 = l2_p$rows)
+    rows = list(l1 = nrow(l1_out), l2 = nrow(l2_out))
   ), class = c("hlm_mdm", "hlm_mdm2"))
 }
 
@@ -244,7 +271,9 @@ hlm_build_mdm4 <- function(level1, level2, level3, level4,
                            vars_l3 = NULL, vars_l4 = NULL,
                            workspace = "default",
                            mdm_name = "model",
-                           l1_missing = TRUE) {
+                           l1_missing = TRUE,
+                           method = c("direct", "wine")) {
+  method <- match.arg(method)
   ws <- if (inherits(workspace, "hlm_workspace")) workspace
         else hlm_workspace(workspace, clean = TRUE)
   l1 <- hlm_load(level1)
@@ -305,52 +334,51 @@ hlm_build_mdm4 <- function(level1, level2, level3, level4,
   l3_p <- hlm_write_sav(l3_out, ws, "level3.sav")
   l4_p <- hlm_write_sav(l4_out, ws, "level4.sav")
 
-  mdmt_text <- paste(c(
-    "#HLM4 MDM CREATION TEMPLATE",
-    "mdmtype:0",
-    "rawdattype:spss",
-    paste0("l1fname:", l1_p$win),
-    paste0("l2fname:", l2_p$win),
-    paste0("l3fname:", l3_p$win),
-    paste0("l4fname:", l4_p$win),
-    paste0("l1missing:", if (l1_missing) "y" else "n"),
-    "timeofdeletion:analysis",
-    paste0("mdmname:", mdm_name),
-    "*begin l1vars",
-    paste0("level4id:", l4_id_t),
-    paste0("level3id:", l3_id_t),
-    paste0("level2id:", l2_id_t),
-    v1,
-    "*end l1vars",
-    "*begin l2vars",
-    paste0("level4id:", l4_id_t),
-    paste0("level3id:", l3_id_t),
-    paste0("level2id:", l2_id_t),
-    v2,
-    "*end l2vars",
-    "*begin l3vars",
-    paste0("level4id:", l4_id_t),
-    paste0("level3id:", l3_id_t),
-    v3,
-    "*end l3vars",
-    "*begin l4vars",
-    paste0("level4id:", l4_id_t),
-    v4,
-    "*end l4vars"
-  ), collapse = "\n")
-  mdmt <- hlm_write_mdmt(mdmt_text, ws, mdm_name)
-  build <- hlm_make_mdm(mdmt, ws, solver = "hlm4.exe")
-  if (!build$success)
-    stop("hlm4.exe -w failed (exit ", build$exit, ")")
+  mdm_path <- file.path(ws$mac, mdm_name)
+  sts_path <- file.path(ws$mac, "HLM4MDM.STS")
+
+  if (method == "direct") {
+    hlm_write_mdm4(l1_out, l2_out, l3_out, l4_out,
+                   l4_id = l4_id_t, l3_id = l3_id_t, l2_id = l2_id_t,
+                   l1_vars = v1, l2_vars = v2, l3_vars = v3, l4_vars = v4,
+                   mdm_path = mdm_path,
+                   l1_sav_win = l1_p$win, l2_sav_win = l2_p$win,
+                   l3_sav_win = l3_p$win, l4_sav_win = l4_p$win,
+                   l1_missing = l1_missing)
+    if (!file.exists(mdm_path))
+      stop("R-native HLM4 .mdm writer failed")
+  } else {
+    mdmt_text <- paste(c(
+      "#HLM4 MDM CREATION TEMPLATE", "mdmtype:0", "rawdattype:spss",
+      paste0("l1fname:", l1_p$win), paste0("l2fname:", l2_p$win),
+      paste0("l3fname:", l3_p$win), paste0("l4fname:", l4_p$win),
+      paste0("l1missing:", if (l1_missing) "y" else "n"),
+      "timeofdeletion:analysis", paste0("mdmname:", mdm_name),
+      "*begin l1vars", paste0("level4id:", l4_id_t),
+      paste0("level3id:", l3_id_t), paste0("level2id:", l2_id_t),
+      v1, "*end l1vars",
+      "*begin l2vars", paste0("level4id:", l4_id_t),
+      paste0("level3id:", l3_id_t), paste0("level2id:", l2_id_t),
+      v2, "*end l2vars",
+      "*begin l3vars", paste0("level4id:", l4_id_t),
+      paste0("level3id:", l3_id_t), v3, "*end l3vars",
+      "*begin l4vars", paste0("level4id:", l4_id_t), v4, "*end l4vars"
+    ), collapse = "\n")
+    mdmt <- hlm_write_mdmt(mdmt_text, ws, mdm_name)
+    build <- hlm_make_mdm(mdmt, ws, solver = "hlm4.exe")
+    if (!build$success) stop("hlm4.exe -w failed (exit ", build$exit, ")")
+    sts_path <- build$sts
+  }
+
   structure(list(
-    workspace = ws, level = 4L,
-    mdm = build$mdm, mdm_win = build$mdm_win,
-    mdmt = mdmt$mac, mdmt_win = mdmt$win,
-    sts = build$sts,
+    workspace = ws, level = 4L, method = method,
+    mdm = mdm_path, mdm_win = hlm_to_win_path(mdm_path),
+    sts = if (file.exists(sts_path)) sts_path else NA_character_,
     l1_path = l1_p, l2_path = l2_p, l3_path = l3_p, l4_path = l4_p,
     l4_id = l4_id, l3_id = l3_id, l2_id = l2_id,
     vars_l1 = v1, vars_l2 = v2, vars_l3 = v3, vars_l4 = v4,
-    rows = list(l1 = l1_p$rows, l2 = l2_p$rows, l3 = l3_p$rows, l4 = l4_p$rows)
+    rows = list(l1 = nrow(l1_out), l2 = nrow(l2_out),
+                l3 = nrow(l3_out), l4 = nrow(l4_out))
   ), class = c("hlm_mdm", "hlm_mdm4"))
 }
 

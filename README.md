@@ -234,6 +234,7 @@ result <- hlm_fit(mdm, spec)
 | `workspace` | character or `hlm_workspace` | `"default"` | workspace name (creates a fresh one inside the bottle) |
 | `mdm_name` | character | `"model"` | basename for the .mdm file |
 | `l1_missing` | logical | `TRUE` | whether L1 has missing values |
+| `method` | `"direct"` / `"wine"` | `"direct"` | `"direct"` writes the `.mdm` natively in R (no Wine needed for this step). `"wine"` uses the legacy `hlm*.exe -w` path (requires Wine + whlm.exe alive in background) |
 
 ---
 

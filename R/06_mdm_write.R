@@ -1,301 +1,241 @@
 # =============================================================================
-# R-native .mdm binary writer.
+# R-native .mdm binary writer for HLM2, HLM3, and HLM4.
 # =============================================================================
 #
-# Writes HLM's binary .mdm files directly from R, eliminating the need for
-# hlm*.exe -w (and the whlm.exe warm-session workaround).
-#
-# Byte layouts derived from RE of hlm2/3/4.exe writers and cross-validated
-# against live .mdm files. See re/notes/04_mdm_writer.md (HLM3),
-# re/notes/07_mdm_hlm2.md (HLM2), re/notes/08_mdm_hlm4.md (HLM4).
-#
-# Format overview (HLM3 Normal-outcome):
-#   [fixed header: magic + version + counts + flags + var names + source paths]
-#   [grand means: L1/L2/L3 per-variable means]
-#   [L3 IDs]
-#   [L3 row matrix: n_L3 × n_L3_vars doubles]
-#   [per-L2 blocks: one variable-length block per L2 unit, containing
-#    nrows + L1-means + L1-rows + L3-id + L2-id + L2-row]
-#   [no trailer]
+# Writes valid .mdm files directly from R, eliminating Wine for MDM build.
+# Byte layouts from re/notes/04_mdm_writer.md (HLM3), 07_mdm_hlm2.md (HLM2),
+# 08_mdm_hlm4.md (HLM4). HLM3 writer is byte-identical to hlm3.exe output.
 
-# Missing-data sentinel. HLM uses a large negative double.
-# The exact value is DAT_004d39d8 in hlm3.exe — set to -9999.0 in the
-# HLM2 writer spec and likely similar in HLM3/4.
-.HLM_MISSING_SENTINEL <- -9999.0
+.HLM_MISSING <- -9999.0
 
-#' Encode a variable name into HLM's 13-byte slot format.
-#'
-#' HLM stores names as: 8 chars RIGHT-justified (space-padded on the left),
-#' then 4 trailing spaces, then 1 NUL byte. Total = 13 bytes. Discovered
-#' by comparing our R-written .mdm against hlm3.exe-written reference.
-#'
-#' @return a raw vector of exactly `width` bytes
-.pad_name <- function(name, width = 13L) {
+# ---- low-level helpers ----
+.w_int32   <- function(con, x) writeBin(as.integer(x),  con, size = 4L, endian = "little")
+.w_float32 <- function(con, x) writeBin(as.double(x),   con, size = 4L, endian = "little")
+.w_double  <- function(con, x) writeBin(as.double(x),   con, size = 8L, endian = "little")
+.w_raw     <- function(con, x) { if (is.raw(x)) writeBin(x, con) else writeBin(charToRaw(x), con) }
+
+#' HLM name slot: 8-char right-justified + 4 trailing spaces + NUL = 13 bytes.
+.pad13 <- function(name) {
   s <- toupper(substr(name, 1L, 8L))
-  rj <- sprintf("%8s", s)                     # right-justify in 8 chars
-  padded <- paste0(rj, "    ")                 # + 4 trailing spaces = 12
-  raw_s <- charToRaw(padded)
-  c(raw_s, raw(width - length(raw_s)))         # + NUL pad to 13
+  rj <- sprintf("%8s", s)
+  raw_s <- charToRaw(paste0(rj, "    "))
+  c(raw_s, raw(13L - length(raw_s)))
 }
 
-# ---- low-level binary writers ----
-
-.write_int32 <- function(con, x) writeBin(as.integer(x), con, size = 4L, endian = "little")
-.write_float32 <- function(con, x) writeBin(as.double(x), con, size = 4L, endian = "little")
-.write_double <- function(con, x) writeBin(as.double(x), con, size = 8L, endian = "little")
-.write_raw_string <- function(con, s) {
-  if (is.raw(s)) writeBin(s, con)
-  else writeBin(charToRaw(s), con)
+#' Write a 260-byte NUL-padded path field.
+.w_path <- function(con, p) {
+  raw <- if (nzchar(p)) charToRaw(substr(p, 1, 259)) else raw(0)
+  writeBin(c(raw, raw(260L - length(raw))), con)
 }
 
-#' Write an HLM3 .mdm file natively.
-#'
-#' Takes the same inputs as hlm_build_mdm3 (after sorting, truncation, and
-#' sav-writing have already been done) and emits a binary .mdm that
-#' hlm3.exe can read directly for model fitting.
-#'
-#' @param l1  data.frame: sorted level-1 data (all columns)
-#' @param l2  data.frame: level-2 data (one row per L2 unit)
-#' @param l3  data.frame: level-3 data (one row per L3 unit)
-#' @param l3_id,l2_id  character: ID column names
-#' @param l1_vars,l2_vars,l3_vars  character vectors of analysis variable names
-#'            (in source order, matching what would go in the .mdmt)
-#' @param mdm_path  output path for the .mdm file
-#' @param l1_sav_win,l2_sav_win,l3_sav_win  Windows paths to the .sav files
-#'            (stored verbatim in the .mdm header as source-file metadata)
-#' @param l1_missing  logical: level-1 has missing data?
-#' @param listwise_delete  logical: delete missing at MDM-creation time?
-#'
-#' @return invisible(mdm_path)
+#' Prepare a numeric matrix from a data.frame + var names.
+.as_dmat <- function(df, vars) {
+  m <- as.matrix(df[, vars, drop = FALSE])
+  m[is.na(m)] <- .HLM_MISSING
+  storage.mode(m) <- "double"
+  m
+}
+
+# ============================================================================
+# HLM3
+# ============================================================================
 hlm_write_mdm3 <- function(l1, l2, l3,
                            l3_id, l2_id,
                            l1_vars, l2_vars, l3_vars,
                            mdm_path,
                            l1_sav_win = "", l2_sav_win = "", l3_sav_win = "",
                            l1_missing = TRUE, listwise_delete = FALSE) {
-  # Validate
-  stopifnot(is.data.frame(l1), is.data.frame(l2), is.data.frame(l3))
-  n_l1_vars <- length(l1_vars)
-  n_l2_vars <- length(l2_vars)
-  n_l3_vars <- length(l3_vars)
-
-  # Build the per-L2 unit structure via sort-merge (trivial since input is
-  # pre-sorted). Group L1 by (l3_id, l2_id).
+  l1_mat <- .as_dmat(l1, l1_vars); l2_mat <- .as_dmat(l2, l2_vars); l3_mat <- .as_dmat(l3, l3_vars)
   l1_key <- paste0(as.character(l1[[l3_id]]), "\x01", as.character(l1[[l2_id]]))
   l2_key <- paste0(as.character(l2[[l3_id]]), "\x01", as.character(l2[[l2_id]]))
-  l3_key <- as.character(l3[[l3_id]])
-
-  # All L1 data as a numeric matrix (analysis vars only)
-  l1_mat <- as.matrix(l1[, l1_vars, drop = FALSE])
-  l1_mat[is.na(l1_mat)] <- .HLM_MISSING_SENTINEL
-  storage.mode(l1_mat) <- "double"
-
-  l2_mat <- as.matrix(l2[, l2_vars, drop = FALSE])
-  l2_mat[is.na(l2_mat)] <- .HLM_MISSING_SENTINEL
-  storage.mode(l2_mat) <- "double"
-
-  l3_mat <- as.matrix(l3[, l3_vars, drop = FALSE])
-  l3_mat[is.na(l3_mat)] <- .HLM_MISSING_SENTINEL
-  storage.mode(l3_mat) <- "double"
-
-  # Group L1 rows by their L2 key
-  l2_units <- unique(l2_key)
-  n_l2_units <- length(l2_units)
-  n_l3_units <- nrow(l3)
-  n_l1_total <- nrow(l1)
-
-  # Determine if IDs are numeric (HLM encodes this via sign bit on mdmtype)
   ids_numeric <- is.numeric(l1[[l3_id]]) && is.numeric(l1[[l2_id]])
-
-  # Compute grand means
-  l1_means <- colMeans(l1_mat, na.rm = TRUE)
-  l2_means <- colMeans(l2_mat, na.rm = TRUE)
-  l3_means <- colMeans(l3_mat, na.rm = TRUE)
-
-  # Compute max rows per L2 unit
   l1_split <- split(seq_len(nrow(l1)), l1_key)
-  max_rows_per_l2 <- max(vapply(l1_split, length, integer(1)))
-
-  # Signed mdmtype: internal HLM3 mdmtype is 6 (from test_thomas_3 analysis).
-  # Sign encodes numeric IDs.
+  l2_units <- unique(l2_key)
   internal_mdmtype <- 6L
   signed_mdmtype <- if (ids_numeric) -internal_mdmtype else internal_mdmtype
 
-  # ---- WRITE ----
-  con <- file(mdm_path, "wb")
-  on.exit(close(con))
-
-  # B.1 — Fixed header
-  .write_raw_string(con, "SSHLM3")                         # magic (6 bytes)
-  .write_float32(con, 8.2)                                  # version (float32)
-  .write_int32(con, n_l1_vars)                              # n_L1_vars
-  .write_int32(con, n_l2_vars)                              # n_L2_vars
-  .write_int32(con, n_l3_vars)                              # n_L3_vars
-  .write_int32(con, n_l1_total)                             # n_L1_records_total
-  .write_int32(con, n_l2_units)                             # n_L2_units
-  .write_int32(con, n_l3_units)                             # n_L3_units
-  .write_int32(con, as.integer(l1_missing))                 # flag_level1_may_miss
-  .write_int32(con, as.integer(listwise_delete))            # flag_listwise_delete
-  .write_int32(con, 0L)                                     # outcome_family = Normal
-  .write_int32(con, signed_mdmtype)                         # signed_mdmtype
-  .write_int32(con, max_rows_per_l2)                        # max_rows_per_L2
-
-  # Var name arrays: INTRCPT + each var, 13-byte padded slots
-  for (v in c("INTRCPT1", l1_vars)) .write_raw_string(con, .pad_name(v))
-  for (v in c("INTRCPT2", l2_vars)) .write_raw_string(con, .pad_name(v))
-  for (v in c("INTRCPT3", l3_vars)) .write_raw_string(con, .pad_name(v))
-
-  # Path field length + source paths (260 bytes each, null-padded)
-  .write_int32(con, 260L)                                   # path_field_len
-  for (p in c(l1_sav_win, l2_sav_win, l3_sav_win)) {
-    raw <- charToRaw(substr(p, 1, 259))
-    pad <- raw(260L - length(raw))
-    writeBin(c(raw, pad), con)
-  }
-
-  # B.2 — Grand means
-  .write_double(con, l1_means)
-  .write_double(con, l2_means)
-  .write_double(con, l3_means)
-
+  con <- file(mdm_path, "wb"); on.exit(close(con))
+  # Header
+  .w_raw(con, "SSHLM3")
+  .w_float32(con, 8.2)
+  .w_int32(con, length(l1_vars)); .w_int32(con, length(l2_vars)); .w_int32(con, length(l3_vars))
+  .w_int32(con, nrow(l1)); .w_int32(con, length(l2_units)); .w_int32(con, nrow(l3))
+  .w_int32(con, as.integer(l1_missing)); .w_int32(con, as.integer(listwise_delete))
+  .w_int32(con, 0L)  # outcome_family = Normal
+  .w_int32(con, signed_mdmtype)
+  .w_int32(con, max(vapply(l1_split, length, integer(1))))
+  # Var names
+  for (v in c("INTRCPT1", l1_vars)) .w_raw(con, .pad13(v))
+  for (v in c("INTRCPT2", l2_vars)) .w_raw(con, .pad13(v))
+  for (v in c("INTRCPT3", l3_vars)) .w_raw(con, .pad13(v))
+  # Paths
+  .w_int32(con, 260L)
+  .w_path(con, l1_sav_win); .w_path(con, l2_sav_win); .w_path(con, l3_sav_win)
+  # Grand means
+  .w_double(con, colMeans(l1_mat, na.rm = TRUE))
+  .w_double(con, colMeans(l2_mat, na.rm = TRUE))
+  .w_double(con, colMeans(l3_mat, na.rm = TRUE))
   # L3 IDs
-  if (ids_numeric) {
-    .write_double(con, as.double(l3[[l3_id]]))
-  } else {
-    for (id in as.character(l3[[l3_id]])) .write_raw_string(con, .pad_name(id))
-  }
-
-  # L3 row matrix: n_L3 × n_L3_vars doubles, row-major
-  for (i in seq_len(n_l3_units)) .write_double(con, l3_mat[i, ])
-
-  # B.3 — Per-L2 blocks
+  if (ids_numeric) .w_double(con, as.double(l3[[l3_id]]))
+  else for (id in as.character(l3[[l3_id]])) .w_raw(con, .pad13(id))
+  # L3 row matrix
+  for (i in seq_len(nrow(l3))) .w_double(con, l3_mat[i, ])
+  # Per-L2 blocks
   for (uk in l2_units) {
-    l1_idx <- l1_split[[uk]]
-    nrows  <- length(l1_idx)
-    l2_row_idx <- match(uk, l2_key)
-    l3_id_val <- l2[[l3_id]][l2_row_idx]
-    l2_id_val <- l2[[l2_id]][l2_row_idx]
-
-    # Per-L2 L1 means (within-unit)
-    l1_block <- l1_mat[l1_idx, , drop = FALSE]
-    l1_unit_means <- colMeans(l1_block, na.rm = TRUE)
-
-    .write_int32(con, nrows)
-    .write_double(con, l1_unit_means)
-    for (r in seq_len(nrows)) .write_double(con, l1_block[r, ])
-
-    # IDs
-    if (ids_numeric) {
-      .write_double(con, as.double(l3_id_val))
-      .write_double(con, as.double(l2_id_val))
-    } else {
-      .write_raw_string(con, .pad_name(as.character(l3_id_val)))
-      .write_raw_string(con, .pad_name(as.character(l2_id_val)))
-    }
-
-    # L2 row
-    .write_double(con, l2_mat[l2_row_idx, ])
+    idx <- l1_split[[uk]]; nrows <- length(idx)
+    l2i <- match(uk, l2_key)
+    blk <- l1_mat[idx, , drop = FALSE]
+    .w_int32(con, nrows)
+    .w_double(con, colMeans(blk, na.rm = TRUE))
+    for (r in seq_len(nrows)) .w_double(con, blk[r, ])
+    if (ids_numeric) { .w_double(con, as.double(l2[[l3_id]][l2i])); .w_double(con, as.double(l2[[l2_id]][l2i])) }
+    else { .w_raw(con, .pad13(as.character(l2[[l3_id]][l2i]))); .w_raw(con, .pad13(as.character(l2[[l2_id]][l2i]))) }
+    .w_double(con, l2_mat[l2i, ])
   }
-
   invisible(mdm_path)
 }
 
-#' Write an HLM2 .mdm file natively.
-#'
-#' Simpler than HLM3: no L3 data, no L3 IDs, no L3 matrix. Per-L2 blocks
-#' carry only L1 data + the L2 ID + the L2 row.
-#' Layout per re/notes/07_mdm_hlm2.md.
+# ============================================================================
+# HLM2 — per re/notes/07_mdm_hlm2.md
+# ============================================================================
 hlm_write_mdm2 <- function(l1, l2,
                            l2_id,
                            l1_vars, l2_vars,
                            mdm_path,
                            l1_sav_win = "", l2_sav_win = "",
                            l1_missing = TRUE, listwise_delete = FALSE) {
-  stopifnot(is.data.frame(l1), is.data.frame(l2))
-  n_l1_vars <- length(l1_vars)
-  n_l2_vars <- length(l2_vars)
-
-  l1_mat <- as.matrix(l1[, l1_vars, drop = FALSE])
-  l1_mat[is.na(l1_mat)] <- .HLM_MISSING_SENTINEL
-  storage.mode(l1_mat) <- "double"
-
-  l2_mat <- as.matrix(l2[, l2_vars, drop = FALSE])
-  l2_mat[is.na(l2_mat)] <- .HLM_MISSING_SENTINEL
-  storage.mode(l2_mat) <- "double"
-
-  l2_key <- as.character(l2[[l2_id]])
-  l1_key <- as.character(l1[[l2_id]])
-  n_l2_units <- nrow(l2)
-  n_l1_total <- nrow(l1)
-
+  l1_mat <- .as_dmat(l1, l1_vars); l2_mat <- .as_dmat(l2, l2_vars)
+  l1_key <- as.character(l1[[l2_id]]); l2_key <- as.character(l2[[l2_id]])
   ids_numeric <- is.numeric(l1[[l2_id]])
-  l1_means <- colMeans(l1_mat, na.rm = TRUE)
-  l2_means <- colMeans(l2_mat, na.rm = TRUE)
-
   l1_split <- split(seq_len(nrow(l1)), l1_key)
-  max_rows_per_l2 <- max(vapply(l1_split, length, integer(1)))
-
-  internal_mdmtype <- 1L  # HLM2 internal type
+  internal_mdmtype <- 6L
   signed_mdmtype <- if (ids_numeric) -internal_mdmtype else internal_mdmtype
 
-  con <- file(mdm_path, "wb")
-  on.exit(close(con))
-
+  con <- file(mdm_path, "wb"); on.exit(close(con))
   # Header
-  .write_raw_string(con, "SSHLM2")
-  .write_float32(con, 8.2)
-  .write_int32(con, n_l1_vars)
-  .write_int32(con, n_l2_vars)
-  .write_int32(con, n_l1_total)
-  .write_int32(con, n_l2_units)
-  .write_int32(con, as.integer(l1_missing))
-  .write_int32(con, as.integer(listwise_delete))
-  .write_int32(con, 0L)                     # outcome_family = Normal
-  .write_int32(con, signed_mdmtype)
-  .write_int32(con, max_rows_per_l2)
-
+  .w_raw(con, "SSHLM2")
+  .w_float32(con, 8.2)
+  .w_int32(con, length(l1_vars)); .w_int32(con, length(l2_vars))
+  .w_int32(con, nrow(l1)); .w_int32(con, nrow(l2))
+  .w_int32(con, as.integer(l1_missing)); .w_int32(con, as.integer(listwise_delete))
+  .w_int32(con, 0L)  # outcome_family
+  .w_int32(con, 0L)  # n_constraints (version > 7.29)
+  .w_int32(con, 0L)  # extra_level (version > 6.209)
+  .w_int32(con, signed_mdmtype)
+  .w_int32(con, max(vapply(l1_split, length, integer(1))))
   # Var names
-  for (v in c("INTRCPT1", l1_vars)) .write_raw_string(con, .pad_name(v))
-  for (v in c("INTRCPT2", l2_vars)) .write_raw_string(con, .pad_name(v))
-
-  # Path field + source paths (2 for HLM2)
-  .write_int32(con, 260L)
-  for (p in c(l1_sav_win, l2_sav_win)) {
-    raw <- charToRaw(substr(p, 1, 259))
-    pad <- raw(260L - length(raw))
-    writeBin(c(raw, pad), con)
-  }
-
-  # Grand means (L1 + L2 only)
-  .write_double(con, l1_means)
-  .write_double(con, l2_means)
-
+  for (v in c("INTRCPT1", l1_vars)) .w_raw(con, .pad13(v))
+  for (v in c("INTRCPT2", l2_vars)) .w_raw(con, .pad13(v))
+  # Paths
+  .w_int32(con, 260L)
+  .w_path(con, l1_sav_win); .w_path(con, l2_sav_win)
+  # Grand means + SDs (version > 7.215 requires SDs)
+  l1_means <- colMeans(l1_mat, na.rm = TRUE)
+  l2_means <- colMeans(l2_mat, na.rm = TRUE)
+  l1_sds <- apply(l1_mat, 2, sd, na.rm = TRUE)
+  l2_sds <- apply(l2_mat, 2, sd, na.rm = TRUE)
+  .w_double(con, l1_means); .w_double(con, l2_means)
+  .w_double(con, l1_sds);   .w_double(con, l2_sds)
   # L2 IDs
-  if (ids_numeric) {
-    .write_double(con, as.double(l2[[l2_id]]))
-  } else {
-    for (id in as.character(l2[[l2_id]])) .write_raw_string(con, .pad_name(id))
-  }
-
-  # Per-L2 blocks (HLM2: no L3 id, just L2 id + L1 data + L2 row)
-  for (i in seq_len(n_l2_units)) {
+  if (ids_numeric) .w_double(con, as.double(l2[[l2_id]]))
+  else for (id in as.character(l2[[l2_id]])) .w_raw(con, .pad13(id))
+  # L2 row matrix
+  for (i in seq_len(nrow(l2))) .w_double(con, l2_mat[i, ])
+  # Per-L2 blocks (HLM2: only nrows + L1_means + L1_rows — no IDs, no L2 row)
+  for (i in seq_len(nrow(l2))) {
     uk <- l2_key[i]
-    l1_idx <- l1_split[[uk]]
-    nrows <- length(l1_idx)
-    l1_block <- l1_mat[l1_idx, , drop = FALSE]
-    l1_unit_means <- colMeans(l1_block, na.rm = TRUE)
-
-    .write_int32(con, nrows)
-    .write_double(con, l1_unit_means)
-    for (r in seq_len(nrows)) .write_double(con, l1_block[r, ])
-
-    if (ids_numeric) {
-      .write_double(con, as.double(l2[[l2_id]][i]))
-    } else {
-      .write_raw_string(con, .pad_name(as.character(l2[[l2_id]][i])))
-    }
-    .write_double(con, l2_mat[i, ])
+    idx <- l1_split[[uk]]; nrows <- length(idx)
+    blk <- l1_mat[idx, , drop = FALSE]
+    .w_int32(con, nrows)
+    .w_double(con, colMeans(blk, na.rm = TRUE))
+    for (r in seq_len(nrows)) .w_double(con, blk[r, ])
   }
+  invisible(mdm_path)
+}
 
+# ============================================================================
+# HLM4 — per re/notes/08_mdm_hlm4.md
+# ============================================================================
+hlm_write_mdm4 <- function(l1, l2, l3, l4,
+                           l4_id, l3_id, l2_id,
+                           l1_vars, l2_vars, l3_vars, l4_vars,
+                           mdm_path,
+                           l1_sav_win = "", l2_sav_win = "",
+                           l3_sav_win = "", l4_sav_win = "",
+                           l1_missing = TRUE, listwise_delete = FALSE) {
+  l1_mat <- .as_dmat(l1, l1_vars); l2_mat <- .as_dmat(l2, l2_vars)
+  l3_mat <- .as_dmat(l3, l3_vars); l4_mat <- .as_dmat(l4, l4_vars)
+  l1_key <- paste0(as.character(l1[[l4_id]]), "\x01",
+                   as.character(l1[[l3_id]]), "\x01",
+                   as.character(l1[[l2_id]]))
+  l2_key <- paste0(as.character(l2[[l4_id]]), "\x01",
+                   as.character(l2[[l3_id]]), "\x01",
+                   as.character(l2[[l2_id]]))
+  ids_numeric <- is.numeric(l1[[l4_id]]) && is.numeric(l1[[l3_id]]) && is.numeric(l1[[l2_id]])
+  l1_split <- split(seq_len(nrow(l1)), l1_key)
+  l2_units <- unique(l2_key)
+  internal_mdmtype <- 6L
+  signed_mdmtype <- if (ids_numeric) -internal_mdmtype else internal_mdmtype
+  # L3 → L4 parent mapping
+  l3_parent_l4 <- l3[[l4_id]]
+
+  con <- file(mdm_path, "wb"); on.exit(close(con))
+  # Header — HLM4 version is DOUBLE (8 bytes), not float32!
+  .w_raw(con, "SSHLM4")
+  .w_double(con, 8.2)  # 8 bytes for HLM4
+  .w_int32(con, length(l1_vars)); .w_int32(con, length(l2_vars))
+  .w_int32(con, length(l3_vars)); .w_int32(con, length(l4_vars))
+  .w_int32(con, nrow(l1)); .w_int32(con, length(l2_units))
+  .w_int32(con, nrow(l3)); .w_int32(con, nrow(l4))
+  .w_int32(con, as.integer(l1_missing)); .w_int32(con, as.integer(listwise_delete))
+  .w_int32(con, 0L)  # outcome_family
+  .w_int32(con, signed_mdmtype)
+  .w_int32(con, max(vapply(l1_split, length, integer(1))))
+  # Var names (4 tables)
+  for (v in c("INTRCPT1", l1_vars)) .w_raw(con, .pad13(v))
+  for (v in c("INTRCPT2", l2_vars)) .w_raw(con, .pad13(v))
+  for (v in c("INTRCPT3", l3_vars)) .w_raw(con, .pad13(v))
+  for (v in c("INTRCPT4", l4_vars)) .w_raw(con, .pad13(v))
+  # Paths (4)
+  .w_int32(con, 260L)
+  .w_path(con, l1_sav_win); .w_path(con, l2_sav_win)
+  .w_path(con, l3_sav_win); .w_path(con, l4_sav_win)
+  # Grand means (4 levels)
+  .w_double(con, colMeans(l1_mat, na.rm = TRUE))
+  .w_double(con, colMeans(l2_mat, na.rm = TRUE))
+  .w_double(con, colMeans(l3_mat, na.rm = TRUE))
+  .w_double(con, colMeans(l4_mat, na.rm = TRUE))
+  # L3 IDs
+  if (ids_numeric) .w_double(con, as.double(l3[[l3_id]]))
+  else for (id in as.character(l3[[l3_id]])) .w_raw(con, .pad13(id))
+  # L3 → L4 parent IDs (NEW in HLM4)
+  if (ids_numeric) .w_double(con, as.double(l3_parent_l4))
+  else for (id in as.character(l3_parent_l4)) .w_raw(con, .pad13(id))
+  # L4 IDs
+  if (ids_numeric) .w_double(con, as.double(l4[[l4_id]]))
+  else for (id in as.character(l4[[l4_id]])) .w_raw(con, .pad13(id))
+  # L3 row matrix
+  for (i in seq_len(nrow(l3))) .w_double(con, l3_mat[i, ])
+  # L4 row matrix
+  for (i in seq_len(nrow(l4))) .w_double(con, l4_mat[i, ])
+  # Per-L2 blocks (same structure as HLM3 but IDs are L4,L3 instead of just L3)
+  for (uk in l2_units) {
+    idx <- l1_split[[uk]]; nrows <- length(idx)
+    l2i <- match(uk, l2_key)
+    blk <- l1_mat[idx, , drop = FALSE]
+    .w_int32(con, nrows)
+    .w_double(con, colMeans(blk, na.rm = TRUE))
+    for (r in seq_len(nrows)) .w_double(con, blk[r, ])
+    if (ids_numeric) {
+      .w_double(con, as.double(l2[[l4_id]][l2i]))
+      .w_double(con, as.double(l2[[l3_id]][l2i]))
+      .w_double(con, as.double(l2[[l2_id]][l2i]))
+    } else {
+      .w_raw(con, .pad13(as.character(l2[[l4_id]][l2i])))
+      .w_raw(con, .pad13(as.character(l2[[l3_id]][l2i])))
+      .w_raw(con, .pad13(as.character(l2[[l2_id]][l2i])))
+    }
+    .w_double(con, l2_mat[l2i, ])
+  }
   invisible(mdm_path)
 }
