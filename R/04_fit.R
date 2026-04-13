@@ -38,7 +38,9 @@ hlm_build_mdm3 <- function(level1, level2, level3,
                            vars_l1 = NULL, vars_l2 = NULL, vars_l3 = NULL,
                            workspace = "default",
                            mdm_name = "model",
-                           l1_missing = TRUE) {
+                           l1_missing = TRUE,
+                           method = c("direct", "wine")) {
+  method <- match.arg(method)
 
   # Workspace
   ws <- if (inherits(workspace, "hlm_workspace")) workspace
@@ -131,34 +133,48 @@ hlm_build_mdm3 <- function(level1, level2, level3,
   # Update vars_l{1,2,3} to the canonical (source-ordered, validated) lists
   vars_l1 <- v1; vars_l2 <- v2; vars_l3 <- v3
 
-  # Build and write .mdmt — use the TRUNCATED names that match the .sav we wrote
-  mdmt_text <- hlm_build_mdmt_text(
-    l1_win = l1_p$win, l2_win = l2_p$win, l3_win = l3_p$win,
-    l3_id = l3_id_t, l2_id = l2_id_t,
-    l1_vars = vars_l1, l2_vars = vars_l2, l3_vars = vars_l3,
-    mdm_name = mdm_name,
-    l1_missing = l1_missing
-  )
-  mdmt <- hlm_write_mdmt(mdmt_text, ws, mdm_name)
+  mdm_path <- file.path(ws$mac, mdm_name)
+  sts_path <- file.path(ws$mac, "HLM3MDM.STS")
 
-  # Run hlm3.exe -w -r to materialize the binary .mdm
-  build <- hlm_make_mdm(mdmt, ws, solver = "hlm3.exe")
-  if (!build$success)
-    stop("hlm3.exe -w failed (exit ", build$exit, "; ",
-         .hlm_exit_meaning(build$exit), ")\nstderr: ", build$stderr)
+  if (method == "direct") {
+    # R-native .mdm writer — no Wine needed, no whlm.exe, no .sav quirks.
+    # Byte-identical to hlm3.exe -w output (verified in development).
+    hlm_write_mdm3(l1_out, l2_out, l3_out,
+                   l3_id = l3_id_t, l2_id = l2_id_t,
+                   l1_vars = vars_l1, l2_vars = vars_l2, l3_vars = vars_l3,
+                   mdm_path = mdm_path,
+                   l1_sav_win = l1_p$win, l2_sav_win = l2_p$win,
+                   l3_sav_win = l3_p$win,
+                   l1_missing = l1_missing)
+    if (!file.exists(mdm_path))
+      stop("R-native .mdm writer failed to create ", mdm_path)
+  } else {
+    # Legacy: write .mdmt + invoke hlm3.exe -w via Wine
+    mdmt_text <- hlm_build_mdmt_text(
+      l1_win = l1_p$win, l2_win = l2_p$win, l3_win = l3_p$win,
+      l3_id = l3_id_t, l2_id = l2_id_t,
+      l1_vars = vars_l1, l2_vars = vars_l2, l3_vars = vars_l3,
+      mdm_name = mdm_name, l1_missing = l1_missing
+    )
+    mdmt <- hlm_write_mdmt(mdmt_text, ws, mdm_name)
+    build <- hlm_make_mdm(mdmt, ws, solver = "hlm3.exe")
+    if (!build$success)
+      stop("hlm3.exe -w failed (exit ", build$exit, "; ",
+           .hlm_exit_meaning(build$exit), ")\nstderr: ", build$stderr)
+    sts_path <- build$sts
+  }
 
   structure(list(
     workspace = ws,
     level     = 3L,
-    mdm       = build$mdm,
-    mdm_win   = build$mdm_win,
-    mdmt      = mdmt$mac,
-    mdmt_win  = mdmt$win,
-    sts       = build$sts,
+    method    = method,
+    mdm       = mdm_path,
+    mdm_win   = hlm_to_win_path(mdm_path),
+    sts       = if (file.exists(sts_path)) sts_path else NA_character_,
     l1_path = l1_p, l2_path = l2_p, l3_path = l3_p,
     l3_id = l3_id, l2_id = l2_id,
     vars_l1 = vars_l1, vars_l2 = vars_l2, vars_l3 = vars_l3,
-    rows = list(l1 = l1_p$rows, l2 = l2_p$rows, l3 = l3_p$rows)
+    rows = list(l1 = nrow(l1_out), l2 = nrow(l2_out), l3 = nrow(l3_out))
   ), class = c("hlm_mdm", "hlm_mdm3"))
 }
 

@@ -11,7 +11,7 @@
 local({
   here <- dirname(sys.frame(1)$ofile)
   for (f in c("00_wine.R", "01_data.R", "02_mdmt.R", "03_hlm.R",
-              "04_fit.R", "05_parse.R")) {
+              "04_fit.R", "05_parse.R", "06_mdm_write.R")) {
     p <- file.path(here, f)
     if (file.exists(p)) source(p) else warning("missing: ", p)
   }
