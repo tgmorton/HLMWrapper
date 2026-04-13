@@ -221,6 +221,123 @@ hlm_build_mdm2 <- function(level1, level2,
   ), class = c("hlm_mdm", "hlm_mdm2"))
 }
 
+#' Build a 4-level MDM. Extends hlm_build_mdm3 with a level-4 file.
+hlm_build_mdm4 <- function(level1, level2, level3, level4,
+                           l4_id, l3_id, l2_id,
+                           vars_l1 = NULL, vars_l2 = NULL,
+                           vars_l3 = NULL, vars_l4 = NULL,
+                           workspace = "default",
+                           mdm_name = "model",
+                           l1_missing = TRUE) {
+  ws <- if (inherits(workspace, "hlm_workspace")) workspace
+        else hlm_workspace(workspace, clean = TRUE)
+  l1 <- hlm_load(level1)
+  l2 <- hlm_load(level2)
+  l3 <- hlm_load(level3)
+  l4 <- hlm_load(level4)
+
+  pick <- function(df, ids, requested) {
+    cols <- setdiff(names(df), ids)
+    if (!is.null(requested)) {
+      bad <- setdiff(requested, names(df))
+      if (length(bad)) stop("requested var(s) not in source: ",
+                            paste(bad, collapse = ", "))
+      cols <- intersect(cols, requested)
+    }
+    cols
+  }
+  v1 <- pick(l1, c(l4_id, l3_id, l2_id), vars_l1)
+  v2 <- pick(l2, c(l4_id, l3_id, l2_id), vars_l2)
+  v3 <- pick(l3, c(l4_id, l3_id),         vars_l3)
+  v4 <- pick(l4, c(l4_id),                vars_l4)
+
+  l1_full <- intersect(names(l1), c(l4_id, l3_id, l2_id, v1))
+  l2_full <- intersect(names(l2), c(l4_id, l3_id, l2_id, v2))
+  l3_full <- intersect(names(l3), c(l4_id, l3_id, v3))
+  l4_full <- intersect(names(l4), c(l4_id, v4))
+  l1_map <- hlm_truncate_names(l1_full)
+  l2_map <- hlm_truncate_names(l2_full)
+  l3_map <- hlm_truncate_names(l3_full)
+  l4_map <- hlm_truncate_names(l4_full)
+
+  hlm_check_higher(l4, l4_id, level = 4L)
+  hlm_check_higher(l3, c(l4_id, l3_id), level = 3L)
+  hlm_check_higher(l2, c(l4_id, l3_id, l2_id), level = 2L)
+
+  l1_sorted <- hlm_sort_l1(l1, l3_id = l4_id, l2_id = l3_id)
+  if (!attr(l1_sorted, "was_sorted"))
+    message("hlmwrap: level-1 sorted automatically.")
+
+  l1_out <- l1_sorted[, l1_full, drop = FALSE]
+  l2_out <- l2[,        l2_full, drop = FALSE]
+  l3_out <- l3[,        l3_full, drop = FALSE]
+  l4_out <- l4[,        l4_full, drop = FALSE]
+  names(l1_out) <- l1_map[names(l1_out)]
+  names(l2_out) <- l2_map[names(l2_out)]
+  names(l3_out) <- l3_map[names(l3_out)]
+  names(l4_out) <- l4_map[names(l4_out)]
+  l4_id_t <- unname(l1_map[l4_id])
+  l3_id_t <- unname(l1_map[l3_id])
+  l2_id_t <- unname(l1_map[l2_id])
+  v1 <- unname(l1_map[v1])
+  v2 <- unname(l2_map[v2])
+  v3 <- unname(l3_map[v3])
+  v4 <- unname(l4_map[v4])
+
+  l1_p <- hlm_write_sav(l1_out, ws, "level1.sav")
+  l2_p <- hlm_write_sav(l2_out, ws, "level2.sav")
+  l3_p <- hlm_write_sav(l3_out, ws, "level3.sav")
+  l4_p <- hlm_write_sav(l4_out, ws, "level4.sav")
+
+  mdmt_text <- paste(c(
+    "#HLM4 MDM CREATION TEMPLATE",
+    "mdmtype:0",
+    "rawdattype:spss",
+    paste0("l1fname:", l1_p$win),
+    paste0("l2fname:", l2_p$win),
+    paste0("l3fname:", l3_p$win),
+    paste0("l4fname:", l4_p$win),
+    paste0("l1missing:", if (l1_missing) "y" else "n"),
+    "timeofdeletion:analysis",
+    paste0("mdmname:", mdm_name),
+    "*begin l1vars",
+    paste0("level4id:", l4_id_t),
+    paste0("level3id:", l3_id_t),
+    paste0("level2id:", l2_id_t),
+    v1,
+    "*end l1vars",
+    "*begin l2vars",
+    paste0("level4id:", l4_id_t),
+    paste0("level3id:", l3_id_t),
+    paste0("level2id:", l2_id_t),
+    v2,
+    "*end l2vars",
+    "*begin l3vars",
+    paste0("level4id:", l4_id_t),
+    paste0("level3id:", l3_id_t),
+    v3,
+    "*end l3vars",
+    "*begin l4vars",
+    paste0("level4id:", l4_id_t),
+    v4,
+    "*end l4vars"
+  ), collapse = "\n")
+  mdmt <- hlm_write_mdmt(mdmt_text, ws, mdm_name)
+  build <- hlm_make_mdm(mdmt, ws, solver = "hlm4.exe")
+  if (!build$success)
+    stop("hlm4.exe -w failed (exit ", build$exit, ")")
+  structure(list(
+    workspace = ws, level = 4L,
+    mdm = build$mdm, mdm_win = build$mdm_win,
+    mdmt = mdmt$mac, mdmt_win = mdmt$win,
+    sts = build$sts,
+    l1_path = l1_p, l2_path = l2_p, l3_path = l3_p, l4_path = l4_p,
+    l4_id = l4_id, l3_id = l3_id, l2_id = l2_id,
+    vars_l1 = v1, vars_l2 = v2, vars_l3 = v3, vars_l4 = v4,
+    rows = list(l1 = l1_p$rows, l2 = l2_p$rows, l3 = l3_p$rows, l4 = l4_p$rows)
+  ), class = c("hlm_mdm", "hlm_mdm4"))
+}
+
 #' Fit a model. Dispatches on the spec class.
 #'
 #' @param mdm   an hlm_mdm built by hlm_build_mdm2/3
@@ -232,9 +349,12 @@ hlm_build_mdm2 <- function(level1, level2,
 hlm_fit <- function(mdm, spec, model_name = "fit", timeout = 600L) {
   stopifnot(inherits(mdm, "hlm_mdm"))
   ws <- mdm$workspace
+  is4 <- inherits(spec, "hlm4_spec")
   is3 <- inherits(spec, "hlm3_spec")
   is2 <- inherits(spec, "hlm2_spec")
-  if (!(is2 || is3)) stop("spec must be an hlm2_spec or hlm3_spec")
+  if (!(is2 || is3 || is4))
+    stop("spec must be an hlm2_spec, hlm3_spec, or hlm4_spec")
+  if (is4 && mdm$level != 4L) stop("hlm4_spec requires a 4-level MDM")
   if (is3 && mdm$level != 3L) stop("hlm3_spec requires a 3-level MDM")
   if (is2 && mdm$level != 2L) stop("hlm2_spec requires a 2-level MDM")
 
@@ -243,12 +363,13 @@ hlm_fit <- function(mdm, spec, model_name = "fit", timeout = 600L) {
   out_mac   <- file.path(ws$mac, paste0(model_name, ".html"))
   if (file.exists(out_mac)) file.remove(out_mac)
 
-  text <- if (is3) hlm_render_hlm3(spec, basename(mdm$mdm), graph_win, out_win)
-          else     hlm_render_hlm2(spec, basename(mdm$mdm), graph_win, out_win)
+  text <- if (is4) hlm_render_hlm4(spec, basename(mdm$mdm), graph_win, out_win)
+          else if (is3) hlm_render_hlm3(spec, basename(mdm$mdm), graph_win, out_win)
+          else          hlm_render_hlm2(spec, basename(mdm$mdm), graph_win, out_win)
 
   hlm_file <- hlm_write_hlm(text, ws, model_name)
 
-  solver <- if (is3) "hlm3.exe" else "hlm2.exe"
+  solver <- if (is4) "hlm4.exe" else if (is3) "hlm3.exe" else "hlm2.exe"
   res <- hlm_run(solver,
                  args = c("-nowait", basename(mdm$mdm), basename(hlm_file$mac)),
                  cwd  = ws$mac,

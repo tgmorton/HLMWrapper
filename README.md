@@ -27,7 +27,7 @@ through dialogs in Whisky for every model. This wrapper:
 |---|---|---|
 | **HLM2** (2-level linear) | ✅ Full | `hlm_build_mdm2`, `hlm2_spec`, end-to-end smoke test |
 | **HLM3** (3-level linear) | ✅ Full | `hlm_build_mdm3`, `hlm3_spec`, end-to-end smoke test |
-| HLM4 (4-level linear) | ⏳ Planned | Binary RE'd; directive vocabulary mapped (uses `FIXTAUPI/BETA/GAMMA`); spec function not yet written |
+| **HLM4** (4-level linear) | ✅ Full | `hlm_build_mdm4`, `hlm4_spec`; uses lowercase `level2:/3:/4:` and `FIXTAUPI/BETA/GAMMA` |
 | HCM2 / HCM3 (cross-classified) | ⏳ Planned | Binaries RE'd; uses `ROWCOL:`, `CLUS:`; spec functions not yet written |
 | HMLM / HMLM2 (multivariate) | ⏳ Planned | Binaries RE'd; uses `R_E_MODEL:`, `UNRESTRICTED:`; wide-format data |
 | HLMHCM (combined) | ⏳ Planned | Binaries RE'd; hybrid `level2:`+`rowcol:`, `FIXTAU/FIXDELTA/FIXOMEGA` |
@@ -186,12 +186,50 @@ plus these HLM2-specific options:
 | `lvr` | `"y"`/`"n"` | `"n"` | latent variable regression (HLM2 calls it `lvr` not `lvr-beta`) |
 | `level2_deletion` | character | `"none"` | L2 deletion variable |
 
-### `hlm_build_mdm3()` / `hlm_build_mdm2()` — data prep
+### `hlm4_spec()` — 4-level linear model
+
+Extends HLM3 with a fourth level. Note the **renamed tau directives** and
+the **lowercase equation keys** (`level2:`, `level3:`, `level4:`; only
+`LEVEL1:` stays uppercase). HLM4 omits many HLM3 options — see the
+directive whitelist in `R/03_hlm.R`.
 
 | Param | Type | Default | Meaning |
 |---|---|---|---|
-| `level1`, `level2`, `level3` | df / file path | required | data sources. Accepts data.frames, `.csv`, `.tsv`, `.sav`, `.dta`, `.xlsx`. `level3` only for `hlm_build_mdm3` |
-| `l3_id`, `l2_id` | character(1) | required | name of the ID column at each level. `l3_id` only for `hlm_build_mdm3` |
+| `outcome` | character(1) | required | level-1 outcome |
+| `l1_predictors` | character/list | `character()` | level-1 predictors |
+| `l2`, `l3` | named list | `list()` | overrides, same as HLM3 |
+| `l4` | named list | `list()` | level-4 overrides. Keys use `"L1/L2/L3"` 3-segment paths, e.g. `"INTRCPT/INTRCPT/INTRCPT"` |
+| `fixtaupi` | integer (0..3) | `3` | level-2 tau constraint (was `fixtau2` in HLM3) |
+| `fixtaubeta` | integer (0..3) | `3` | level-3 tau constraint (was `fixtau3` in HLM3) |
+| `fixtaugamma` | integer (0..3) | `3` | level-4 tau constraint (HLM4 only) |
+| `vagueprior` | `"y"`/`"n"` | `"n"` | vague prior (HLM4 only) |
+| `level1_deletion` | character | `"none"` | L1 deletion variable |
+| `extras` | named list | `list()` | raw directives, validated against the HLM4 whitelist |
+
+**Quick HLM4 example:**
+
+```r
+mdm <- hlm_build_mdm4(
+  level1 = "trials.csv", level2 = "conditions.csv",
+  level3 = "people.csv", level4 = "sites.csv",
+  l4_id = "SITE", l3_id = "PID", l2_id = "COND"
+)
+spec <- hlm4_spec(
+  outcome = "AROUSAL",
+  l1_predictors = "D1_OBS",
+  l2 = list(INTRCPT = list(random = TRUE)),
+  l3 = list("INTRCPT/INTRCPT" = list(random = TRUE)),
+  l4 = list("INTRCPT/INTRCPT/INTRCPT" = list(random = TRUE))
+)
+result <- hlm_fit(mdm, spec)
+```
+
+### `hlm_build_mdm3()` / `hlm_build_mdm2()` / `hlm_build_mdm4()` — data prep
+
+| Param | Type | Default | Meaning |
+|---|---|---|---|
+| `level1`, `level2`, `level3`, `level4` | df / file path | required | data sources. Accepts data.frames, `.csv`, `.tsv`, `.sav`, `.dta`, `.xlsx`. `level3` only for mdm3/mdm4; `level4` only for mdm4 |
+| `l4_id`, `l3_id`, `l2_id` | character(1) | required | name of the ID column at each level. `l4_id` only for mdm4; `l3_id` for mdm3/mdm4 |
 | `vars_l1`, `vars_l2`, `vars_l3` | character vector or `NULL` | `NULL` | columns to include. `NULL` = include all source columns (recommended; HLM mis-reads partial files in some cases). Order must match source-file order if you specify a subset. |
 | `workspace` | character or `hlm_workspace` | `"default"` | workspace name (creates a fresh one inside the bottle) |
 | `mdm_name` | character | `"model"` | basename for the .mdm file |

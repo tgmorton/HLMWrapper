@@ -474,6 +474,219 @@ hlm_render_hlm2 <- function(spec, mdm_basename,
   paste(L, collapse = "\n")
 }
 
+# =============================================================================
+# HLM4 — 4-level linear model
+# =============================================================================
+
+#' Build an HLM4 model spec.
+#'
+#' Extends `hlm3_spec` by adding a fourth level. Key syntax differences from
+#' HLM3 (discovered via RE of hlm4.exe writer FUN_0040cad0):
+#'   - `LEVEL1:` is uppercase; `level2:`, `level3:`, `level4:` are **lowercase**
+#'   - Tau constraints use `FIXTAUPI:` / `FIXTAUBETA:` / `FIXTAUGAMMA:` (not
+#'     `FIXTAU2:`/`FIXTAU3:`)
+#'   - HLM4 omits many HLM3 directives: `HYPOTH`, `CONSTRAIN`, `TAYLOR`,
+#'     `LAPLACE`, `agq`, `LVR-BETA`, `PLAUSVALS`, `VARIANCEKNOWN`, weights
+#'
+#' @inheritParams hlm3_spec
+#' @param l4  named list of level-4 equation overrides. Keys are
+#'            `"L1coef/L2coef/L3coef"` paths. Same shape as l3 entries.
+#' @param fixtaupi,fixtaubeta,fixtaugamma  integer (0..3) — tau constraints
+#'            at each level (HLM4 naming)
+#' @param vagueprior  "y"/"n" — vague prior (unique to hlm4)
+hlm4_spec <- function(outcome,
+                      l1_predictors = character(),
+                      l2 = list(),
+                      l3 = list(),
+                      l4 = list(),
+                      numit = 100L,
+                      stopval = 1e-6,
+                      accel = 5L,
+                      fixtaupi = 3L,
+                      fixtaubeta = 3L,
+                      fixtaugamma = 3L,
+                      fulloutput = "n",
+                      title = "no title",
+                      level1_deletion = "none",
+                      vagueprior = "n",
+                      extras = list()) {
+  stopifnot(is.character(outcome), length(outcome) == 1L)
+  .validate_var_name(outcome, "outcome")
+  l1_pred_names <- .extract_var_names(l1_predictors)
+  .validate_var_name(l1_pred_names, "l1_predictors")
+  l1_coefs <- c("INTRCPT", l1_pred_names)
+  if (anyDuplicated(l1_coefs)) stop("duplicate level-1 coefficient name")
+
+  # Fill L2 defaults
+  l2_full <- lapply(l1_coefs, function(coef) {
+    user <- l2[[coef]]
+    list(coef = coef,
+         predictors = user$predictors %||% character(),
+         random     = user$random     %||% (coef == "INTRCPT"))
+  })
+  names(l2_full) <- l1_coefs
+
+  # Fill L3 defaults from L2
+  l3_full <- list()
+  for (l1c in l1_coefs) {
+    l2_eq <- l2_full[[l1c]]
+    l2_coef_names <- c("INTRCPT", .extract_var_names(l2_eq$predictors))
+    for (l2c in l2_coef_names) {
+      key <- paste0(l1c, "/", l2c)
+      user <- l3[[key]]
+      l3_full[[key]] <- list(l1c = l1c, l2c = l2c,
+                             predictors = user$predictors %||% character(),
+                             random = user$random %||% FALSE)
+    }
+  }
+
+  # Fill L4 defaults from L3
+  l4_full <- list()
+  for (k3 in names(l3_full)) {
+    l3_eq <- l3_full[[k3]]
+    l3_coef_names <- c("INTRCPT", .extract_var_names(l3_eq$predictors))
+    for (l3c in l3_coef_names) {
+      key <- paste0(k3, "/", l3c)
+      user <- l4[[key]]
+      l4_full[[key]] <- list(
+        path = k3, l3c = l3c,
+        predictors = user$predictors %||% character(),
+        random = user$random %||% FALSE
+      )
+    }
+  }
+
+  # Validate user-supplied l3/l4 keys
+  for (k in names(l3)) {
+    if (!k %in% names(l3_full))
+      stop("l3 key '", k, "' doesn't match any l2 coefficient. Valid: ",
+           paste(names(l3_full), collapse = ", "))
+  }
+  for (k in names(l4)) {
+    if (!k %in% names(l4_full))
+      stop("l4 key '", k, "' doesn't match any l3 coefficient. Valid: ",
+           paste(head(names(l4_full), 10), collapse = ", "), "...")
+  }
+
+  .validate_extras(extras, .HLM4_DIRECTIVE_WHITELIST, "hlm4_spec")
+  structure(list(
+    outcome = outcome,
+    l1_predictors = l1_predictors,
+    .l1_coef_names = l1_coefs,
+    l2 = l2_full,
+    l3 = l3_full,
+    l4 = l4_full,
+    options = list(
+      numit = as.integer(numit),
+      stopval = stopval,
+      accel = as.integer(accel),
+      fixtaupi = as.integer(fixtaupi),
+      fixtaubeta = as.integer(fixtaubeta),
+      fixtaugamma = as.integer(fixtaugamma),
+      fulloutput = fulloutput,
+      title = title,
+      level1_deletion = level1_deletion,
+      vagueprior = vagueprior
+    ),
+    extras = extras
+  ), class = "hlm4_spec")
+}
+
+# HLM4 directive whitelist (per 06_writer_matrix.md — much smaller than HLM3)
+.HLM4_DIRECTIVE_WHITELIST <- c(
+  "nonlin","numit","stopval","level1","level2","level3","level4",
+  "level1deletion","accel",
+  "fixtaupi","fixtaubeta","fixtaugamma",
+  "diagonalizetaupi","diagonalizetaubeta","diagonalizetaugamma",
+  "graphgammas","title","output","fulloutput",
+  "resfil1","resfil2","resfil3","resfil4",
+  "resfil1name","resfil2name","resfil3name","resfil4name","resfiltype",
+  "vagueprior","gamma","startvals","debug","deviance",
+  "macroit","microit","stopmicro","stopmacro","dofisher","fishertype"
+)
+
+#' Render an hlm4_spec to a .hlm command file body.
+#'
+#' HLM4 uses uppercase `LEVEL1:` but **lowercase** `level2:`, `level3:`,
+#' `level4:` — this is verified from the writer at FUN_0040cad0.
+hlm_render_hlm4 <- function(spec, mdm_basename,
+                            graphgammas_win, output_html_win) {
+  stopifnot(inherits(spec, "hlm4_spec"))
+  L <- character()
+  push <- function(x) L[length(L) + 1L] <<- x
+
+  push(sprintf("#WHLM CMD FILE FOR %s", mdm_basename))
+  push("nonlin:n")
+  push(sprintf("numit:%d",       spec$options$numit))
+  push(sprintf("stopval:%.10f",  spec$options$stopval))
+
+  # Level-1 (uppercase LEVEL1:)
+  l1_pred_tokens <- vapply(.normalize_predictors(spec$l1_predictors),
+                           .render_predictor, character(1))
+  l1_rhs <- c("INTRCPT1", l1_pred_tokens)
+  push(sprintf("LEVEL1:%s=%s+RANDOM",
+               spec$outcome, paste(l1_rhs, collapse = "+")))
+
+  # Depth-first walk: L1 coef → L2 eq → L2 coefs → L3 eq → L3 coefs → L4 eq
+  for (l1c in spec$.l1_coef_names) {
+    l2_eq <- spec$l2[[l1c]]
+    l2_lhs <- if (l1c == "INTRCPT") "INTRCPT1" else l1c
+    l2_pred_tokens <- vapply(.normalize_predictors(l2_eq$predictors),
+                             .render_predictor, character(1))
+    l2_rhs <- c("INTRCPT2", l2_pred_tokens)
+    # lowercase level2:
+    push(sprintf("level2:%s=%s%s/",
+                 l2_lhs, paste(l2_rhs, collapse = "+"),
+                 if (l2_eq$random) "+random" else ""))
+
+    l2_coef_names <- c("INTRCPT", .extract_var_names(l2_eq$predictors))
+    for (l2c in l2_coef_names) {
+      l3_key <- paste0(l1c, "/", l2c)
+      l3_eq <- spec$l3[[l3_key]]
+      l3_lhs <- if (l2c == "INTRCPT") "INTRCPT2" else l2c
+      l3_pred_tokens <- vapply(.normalize_predictors(l3_eq$predictors),
+                               .render_predictor, character(1))
+      l3_rhs <- c("INTRCPT3", l3_pred_tokens)
+      # lowercase level3:
+      push(sprintf("level3:%s=%s%s/",
+                   l3_lhs, paste(l3_rhs, collapse = "+"),
+                   if (l3_eq$random) "+random" else ""))
+
+      l3_coef_names <- c("INTRCPT", .extract_var_names(l3_eq$predictors))
+      for (l3c in l3_coef_names) {
+        l4_key <- paste0(l3_key, "/", l3c)
+        l4_eq <- spec$l4[[l4_key]]
+        l4_lhs <- if (l3c == "INTRCPT") "INTRCPT3" else l3c
+        l4_pred_tokens <- vapply(.normalize_predictors(l4_eq$predictors),
+                                 .render_predictor, character(1))
+        l4_rhs <- c("INTRCPT4", l4_pred_tokens)
+        # lowercase level4:
+        push(sprintf("level4:%s=%s%s/",
+                     l4_lhs, paste(l4_rhs, collapse = "+"),
+                     if (l4_eq$random) "+random" else ""))
+      }
+    }
+  }
+
+  # Trailing options (HLM4-specific subset)
+  push(sprintf("FIXTAUPI:%d",      spec$options$fixtaupi))
+  push(sprintf("FIXTAUBETA:%d",    spec$options$fixtaubeta))
+  push(sprintf("FIXTAUGAMMA:%d",   spec$options$fixtaugamma))
+  push(sprintf("accel:%d",         spec$options$accel))
+  push(sprintf("LEVEL1DELETION:%s",spec$options$level1_deletion))
+  push("resfil1:n")
+  push("resfil2:n")
+  push("resfil3:n")
+  push("resfil4:n")
+  push(sprintf("graphgammas:%s",   graphgammas_win))
+  push(sprintf("title:%s",        spec$options$title))
+  push(sprintf("output:%s",       output_html_win))
+  push(sprintf("fulloutput:%s",   spec$options$fulloutput))
+  push(sprintf("vagueprior:%s",   spec$options$vagueprior))
+  for (k in names(spec$extras)) push(sprintf("%s:%s", k, spec$extras[[k]]))
+  paste(L, collapse = "\n")
+}
+
 #' Write an .hlm file to disk and return paths.
 hlm_write_hlm <- function(text, ws, basename = "model") {
   if (!grepl("\\.hlm$", basename, ignore.case = TRUE))
