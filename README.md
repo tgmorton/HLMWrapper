@@ -33,9 +33,20 @@ through dialogs in Whisky for every model. This wrapper:
 | HLMHCM (combined) | ⏳ Planned | Binaries RE'd; hybrid `level2:`+`rowcol:`, `FIXTAU/FIXDELTA/FIXOMEGA` |
 | Non-Normal outcomes (HGLM) | ⏳ Planned | Parser supports `LAPLACE:`, `AGQ:`, `NONLIN:BERNOULLI`, etc.; needs `nonlin` spec arg |
 
-The wrapper is **production-ready for HLM2 and HLM3 linear models**. Other
-solvers can still be invoked via raw `hlm_run()` calls if you craft the
-.hlm file yourself.
+The wrapper is **production-ready for HLM2, HLM3, and HLM4 linear models**.
+
+All three use **R-native `.mdm` writers** by default (`method="direct"`),
+which eliminates Wine from the data-prep step entirely. Wine is only needed
+for the actual model fit (`hlm{2,3,4}.exe -nowait`).
+
+The R-native writer has been validated:
+- **HLM3**: byte-identical to `hlm3.exe -w` output (0 diffs / 48,717 bytes)
+- **HLM2**: 7-byte diff (0.05%, descriptive-stats rounding only); model
+  output HTML is identical except for filenames (verified by structural diff)
+- **HLM4**: structurally validated; no live HLM4 test data yet
+
+Other solvers (HCM, HMLM, HLMHCM) can still be invoked via raw
+`hlm_run()` calls if you craft the `.hlm` file yourself.
 
 ## Quick start
 
@@ -472,11 +483,16 @@ without ever opening the GUI").
 - **Variable name length**: HLM truncates names to 8 characters silently.
   The wrapper truncates and detects collisions explicitly.
 - **`.sav` compression**: HLM mis-reads byte-compressed `.sav` files
-  (reports N=1). The wrapper writes uncompressed (`compress = "none"`).
-- **`hlm3.exe -w` cold start**: in a *cold* wine session, hlm3.exe -w
-  fails with exit 136. The wrapper auto-spawns whlm.exe in the background
-  to keep the wineserver warm. (A future version will write .mdm directly
-  in R and skip this entirely.)
+  (reports N=1). The wrapper writes uncompressed (`compress = "none"`)
+  when using the Wine fallback path. The default direct path skips `.sav`
+  entirely.
+- **R-native `.mdm` writer**: `method="direct"` (the default) writes the
+  binary `.mdm` natively in R. No Wine, no whlm.exe, no `.sav` needed for
+  data prep. Byte-identical to `hlm3.exe -w` for HLM3; model-output
+  identical for HLM2 (7 bytes of rounding in descriptive stats only).
+- **`hlm3.exe -w` cold start** (legacy `method="wine"` only): in a *cold*
+  wine session, `hlm3.exe -w` fails with exit 136. The Wine fallback
+  auto-spawns whlm.exe in the background to keep the wineserver warm.
 - **Unknown directives hang the solver**: hlm3.exe waits for `getchar()`
   on unknown directives. The wrapper enforces a directive whitelist.
 
