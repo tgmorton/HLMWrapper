@@ -39,7 +39,8 @@ hlm_build_mdm3 <- function(level1, level2, level3,
                            workspace = "default",
                            mdm_name = "model",
                            l1_missing = TRUE,
-                           method = c("direct", "wine")) {
+                           method = c("direct", "wine"),
+                           save_dir = NULL) {
   method <- match.arg(method)
 
   # Workspace
@@ -164,7 +165,7 @@ hlm_build_mdm3 <- function(level1, level2, level3,
     sts_path <- build$sts
   }
 
-  structure(list(
+  mdm_obj <- structure(list(
     workspace = ws,
     level     = 3L,
     method    = method,
@@ -176,6 +177,11 @@ hlm_build_mdm3 <- function(level1, level2, level3,
     vars_l1 = vars_l1, vars_l2 = vars_l2, vars_l3 = vars_l3,
     rows = list(l1 = nrow(l1_out), l2 = nrow(l2_out), l3 = nrow(l3_out))
   ), class = c("hlm_mdm", "hlm_mdm3"))
+
+  if (!is.null(save_dir))
+    hlm_save_files(mdm_obj, save_dir)
+
+  mdm_obj
 }
 
 #' Build a 2-level MDM. Same as hlm_build_mdm3 but no level-3 file.
@@ -185,7 +191,8 @@ hlm_build_mdm2 <- function(level1, level2,
                            workspace = "default",
                            mdm_name = "model",
                            l1_missing = TRUE,
-                           method = c("direct", "wine")) {
+                           method = c("direct", "wine"),
+                           save_dir = NULL) {
   method <- match.arg(method)
   ws <- if (inherits(workspace, "hlm_workspace")) workspace
         else hlm_workspace(workspace, clean = TRUE)
@@ -253,7 +260,7 @@ hlm_build_mdm2 <- function(level1, level2,
     sts_path <- build$sts
   }
 
-  structure(list(
+  mdm_obj <- structure(list(
     workspace = ws, level = 2L, method = method,
     mdm = mdm_path, mdm_win = hlm_to_win_path(mdm_path),
     sts = if (file.exists(sts_path)) sts_path else NA_character_,
@@ -262,6 +269,11 @@ hlm_build_mdm2 <- function(level1, level2,
     vars_l1 = vars_l1, vars_l2 = vars_l2,
     rows = list(l1 = nrow(l1_out), l2 = nrow(l2_out))
   ), class = c("hlm_mdm", "hlm_mdm2"))
+
+  if (!is.null(save_dir))
+    hlm_save_files(mdm_obj, save_dir)
+
+  mdm_obj
 }
 
 #' Build a 4-level MDM. Extends hlm_build_mdm3 with a level-4 file.
@@ -272,7 +284,8 @@ hlm_build_mdm4 <- function(level1, level2, level3, level4,
                            workspace = "default",
                            mdm_name = "model",
                            l1_missing = TRUE,
-                           method = c("direct", "wine")) {
+                           method = c("direct", "wine"),
+                           save_dir = NULL) {
   method <- match.arg(method)
   ws <- if (inherits(workspace, "hlm_workspace")) workspace
         else hlm_workspace(workspace, clean = TRUE)
@@ -370,7 +383,7 @@ hlm_build_mdm4 <- function(level1, level2, level3, level4,
     sts_path <- build$sts
   }
 
-  structure(list(
+  mdm_obj <- structure(list(
     workspace = ws, level = 4L, method = method,
     mdm = mdm_path, mdm_win = hlm_to_win_path(mdm_path),
     sts = if (file.exists(sts_path)) sts_path else NA_character_,
@@ -380,6 +393,11 @@ hlm_build_mdm4 <- function(level1, level2, level3, level4,
     rows = list(l1 = nrow(l1_out), l2 = nrow(l2_out),
                 l3 = nrow(l3_out), l4 = nrow(l4_out))
   ), class = c("hlm_mdm", "hlm_mdm4"))
+
+  if (!is.null(save_dir))
+    hlm_save_files(mdm_obj, save_dir)
+
+  mdm_obj
 }
 
 #' Fit a model. Dispatches on the spec class.
@@ -390,7 +408,8 @@ hlm_build_mdm4 <- function(level1, level2, level3, level4,
 #' @param timeout    seconds before killing the solver
 #'
 #' @return an hlm_result list (parsed from HTML)
-hlm_fit <- function(mdm, spec, model_name = "fit", timeout = 600L) {
+hlm_fit <- function(mdm, spec, model_name = "fit", timeout = 600L,
+                    save_dir = NULL) {
   stopifnot(inherits(mdm, "hlm_mdm"))
   ws <- mdm$workspace
   is4 <- inherits(spec, "hlm4_spec")
@@ -424,7 +443,7 @@ hlm_fit <- function(mdm, spec, model_name = "fit", timeout = 600L) {
 
   parsed <- if (produced_html) hlm_parse_html(out_mac) else list()
 
-  structure(list(
+  result <- structure(list(
     spec = spec,
     mdm  = mdm,
     workspace = ws,
@@ -447,6 +466,11 @@ hlm_fit <- function(mdm, spec, model_name = "fit", timeout = 600L) {
                       paste(readLines(out_mac, warn = FALSE), collapse = "\n")
                     else NA_character_
   ), class = "hlm_result")
+
+  if (!is.null(save_dir))
+    hlm_save_files(result, save_dir)
+
+  result
 }
 
 #' Save the raw HLM HTML output to a chosen path.
@@ -459,6 +483,90 @@ hlm_save_html <- function(result, path) {
     stop("no HTML output is attached to this result")
   writeLines(result$html, path)
   invisible(path)
+}
+
+#' Copy intermediate HLM files out of the Whisky bottle workspace.
+#'
+#' Copies any combination of .mdm, .hlm, .html, and .sav files from the
+#' workspace to a user-specified directory so they can be opened in the HLM
+#' GUI or inspected manually.
+#'
+#' Works with either an hlm_result (from hlm_fit) or an hlm_mdm (from
+#' hlm_build_mdm*). When given an hlm_result, all file types are available.
+#' When given an hlm_mdm, only the MDM and SAV files exist.
+#'
+#' @param x       an hlm_result or hlm_mdm object
+#' @param dir     destination directory (created if it doesn't exist)
+#' @param which   character vector of file types to copy. Any subset of
+#'                \code{c("mdm", "hlm", "html", "sav")}. Default: all that
+#'                exist for the object type.
+#'
+#' @return Named character vector of destination paths (invisibly).
+hlm_save_files <- function(x, dir, which = NULL) {
+  is_result <- inherits(x, "hlm_result")
+  is_mdm    <- inherits(x, "hlm_mdm")
+  if (!is_result && !is_mdm)
+    stop("x must be an hlm_result or hlm_mdm object")
+
+  if (!dir.exists(dir))
+    dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+  dir <- normalizePath(dir, mustWork = TRUE)
+
+  # Resolve workspace
+  ws <- if (is_result) x$workspace else x$workspace
+
+  # Build a named list of source paths: name -> mac_path
+  sources <- list()
+
+  # MDM file
+  mdm_path <- if (is_result) x$files$mdm else x$mdm
+  if (!is.null(mdm_path) && file.exists(mdm_path))
+    sources[["mdm"]] <- mdm_path
+
+  # HLM command file
+  if (is_result && !is.null(x$files$hlm) && file.exists(x$files$hlm))
+    sources[["hlm"]] <- x$files$hlm
+
+  # HTML output
+  if (is_result && !is.null(x$files$html) && file.exists(x$files$html))
+    sources[["html"]] <- x$files$html
+
+  # SAV files — scan the workspace for any .sav
+  sav_files <- list.files(ws$mac, pattern = "\\.sav$", full.names = TRUE,
+                          ignore.case = TRUE)
+  if (length(sav_files)) sources[["sav"]] <- sav_files
+
+  # Filter to requested types
+  all_types <- c("mdm", "hlm", "html", "sav")
+  if (is.null(which)) {
+    which <- intersect(all_types, names(sources))
+  } else {
+    bad <- setdiff(which, all_types)
+    if (length(bad))
+      stop("unknown file type(s): ", paste(bad, collapse = ", "),
+           ". Use any of: ", paste(all_types, collapse = ", "))
+  }
+
+  copied <- character()
+  for (type in which) {
+    src <- sources[[type]]
+    if (is.null(src)) next
+    for (s in src) {
+      dest <- file.path(dir, basename(s))
+      file.copy(s, dest, overwrite = TRUE)
+      copied <- c(copied, setNames(dest, basename(s)))
+    }
+  }
+
+  if (length(copied)) {
+    message("hlmwrap: copied ", length(copied), " file(s) to ", dir)
+    for (nm in names(copied)) message("  ", nm)
+  } else {
+    message("hlmwrap: no files matched for types: ",
+            paste(which, collapse = ", "))
+  }
+
+  invisible(copied)
 }
 
 #' Print method for hlm_result.
